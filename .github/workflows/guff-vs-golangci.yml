@@ -79,16 +79,24 @@ jobs:
       - name: Record the environment
         run: |
           set -euo pipefail
+          # Written to a file as well as the summary: the step summary is not
+          # retrievable from the run log or the artifact afterwards, and a
+          # benchmark whose hardware and versions you cannot recover later is
+          # not a result anyone can check.
           {
-            echo "## Environment"
-            echo
-            echo '```'
             echo "runner    : $(nproc) cores, $(free -g | awk '/^Mem:/{print $2}') GB RAM"
             echo "go        : $(go version)"
             echo "guff      : $(guff version)"
             echo "golangci  : $(golangci-lint version 2>&1 | head -1)"
             echo "commit    : ${GITHUB_SHA}"
             echo "packages  : $(go list ./... | wc -l) root packages"
+          } | tee "${RUNNER_TEMP}/environment.txt"
+
+          {
+            echo "## Environment"
+            echo
+            echo '```'
+            cat "${RUNNER_TEMP}/environment.txt"
             echo '```'
           } >> "${GITHUB_STEP_SUMMARY}"
 
@@ -226,9 +234,12 @@ jobs:
             tar -czf "${RUNNER_TEMP}/${label}.tar.gz" -C "${dir}" . 2>/dev/null
             end=$(date +%s%3N)
             gz=$(du -sh "${RUNNER_TEMP}/${label}.tar.gz" 2>/dev/null | cut -f1)
+            # Both to the summary and to stdout: the step summary is not in the
+            # run log or the artifact, so anything written only there is
+            # unreadable afterwards without opening the web UI.
             printf '| %s | %s | %s | %d.%03ds |\n' \
               "${label}" "${raw}" "${gz}" "$(( (end - start) / 1000 ))" "$(( (end - start) % 1000 ))" \
-              >> "${RUNNER_TEMP}/notes.md"
+              | tee -a "${RUNNER_TEMP}/notes.md"
             rm -f "${RUNNER_TEMP}/${label}.tar.gz"
           }
 
@@ -351,7 +362,9 @@ jobs:
           name: lint-output
           path: |
             ${{ runner.temp }}/*.out
+            ${{ runner.temp }}/*.txt
             ${{ runner.temp }}/results.tsv
+            ${{ runner.temp }}/notes.md
           if-no-files-found: warn
 
       - name: Confirm the tree was left clean
