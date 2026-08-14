@@ -300,14 +300,29 @@ jobs:
             guff run --no-config --default standard --no-cache --issues-exit-code 0 ./...
           cp "${LAST_OUT}" "${RUNNER_TEMP}/cache-cold.out"
 
-          verdict_n=$(grep -cE '^[^[:space:]].*\.go:[0-9]+:[0-9]+: ' "${RUNNER_TEMP}/cache-warm.out" || true)
+          # Compare the SET of findings, not the transcript. The two runs emit
+          # the same findings in a different order — measured here at 841 each,
+          # equal once sorted — because emission follows the order work
+          # finished and serving packages from cache changes that. Diffing
+          # transcripts reports a cache bug that is not there.
+          findings_of() {
+            LC_ALL=C grep -E '^[^[:space:]].*:[0-9]+:[0-9]+: ' "$1" | LC_ALL=C sort
+          }
+          findings_of "${RUNNER_TEMP}/cache-warm.out" > "${RUNNER_TEMP}/cache-warm.findings"
+          findings_of "${RUNNER_TEMP}/cache-cold.out" > "${RUNNER_TEMP}/cache-cold.findings"
+          verdict_n=$(wc -l < "${RUNNER_TEMP}/cache-warm.findings")
+
           if [ "${verdict_n}" -eq 0 ]; then
             echo "CACHE_VERDICT=inconclusive — nothing was reported to compare" >> "${GITHUB_ENV}"
-          elif diff -q "${RUNNER_TEMP}/cache-warm.out" "${RUNNER_TEMP}/cache-cold.out" >/dev/null 2>&1; then
-            echo "CACHE_VERDICT=identical to a cold run across ${verdict_n} findings" >> "${GITHUB_ENV}"
+          elif diff -q "${RUNNER_TEMP}/cache-warm.findings" "${RUNNER_TEMP}/cache-cold.findings" >/dev/null 2>&1; then
+            ordering=""
+            if ! diff -q "${RUNNER_TEMP}/cache-warm.out" "${RUNNER_TEMP}/cache-cold.out" >/dev/null 2>&1; then
+              ordering=" (same findings, different emission order)"
+            fi
+            echo "CACHE_VERDICT=identical to a cold run across ${verdict_n} findings${ordering}" >> "${GITHUB_ENV}"
           else
             echo "CACHE_VERDICT=**DIVERGED from a cold run — see the diff below**" >> "${GITHUB_ENV}"
-            diff -u "${RUNNER_TEMP}/cache-warm.out" "${RUNNER_TEMP}/cache-cold.out" \
+            diff -u "${RUNNER_TEMP}/cache-warm.findings" "${RUNNER_TEMP}/cache-cold.findings" \
               > "${RUNNER_TEMP}/cache-diff.txt" || true
           fi
 
