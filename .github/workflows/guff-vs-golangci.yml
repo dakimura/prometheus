@@ -236,6 +236,66 @@ jobs:
           archive_cost "guff-seeded" "${RUNNER_TEMP}/guff-cache-seeded"
           archive_cost "golangci-lint" "${GOLANGCI_LINT_CACHE}"
 
+          ####################################################################
+          # Overlap probe.
+          #
+          # Under this repo's own config both tools report nothing, because
+          # upstream enforces that exact gate — agreement, but agreement on an
+          # empty set, which says nothing about what either tool would MISS.
+          # Dropping the config removes the repo's large exclusion list and
+          # gives both something to find.
+          #
+          # golangci-lint needs its issue caps lifted here. It defaults to
+          # max-issues-per-linter=50 / max-same-issues=3; this repo's config
+          # sets both to 0, but --no-config restores the defaults, and a capped
+          # run silently truncates to 50 errcheck findings. Comparing against
+          # that produces a spectacular and completely fictional gap.
+          #
+          # Compared by source location, not message text: for an unchecked
+          # error the two tools name the callee differently — guff resolves the
+          # method (`(*os.File).Close`), golangci-lint prints the receiver as
+          # written (`fd.Close`) — so equal findings would not compare equal as
+          # strings.
+          #
+          # This is one codebase and one linter set. It is a smoke test, not a
+          # compatibility audit; guff's own compat harness is what answers that.
+          ####################################################################
+          measure "golangci-lint no-config" \
+            golangci-lint run --no-config --default standard \
+              --max-issues-per-linter 0 --max-same-issues 0 \
+              --issues-exit-code 0 ./...
+          cp "${LAST_OUT}" "${RUNNER_TEMP}/overlap-golangci.out"
+
+          measure "guff no-config" \
+            guff run --no-config --default standard --issues-exit-code 0 ./...
+          cp "${LAST_OUT}" "${RUNNER_TEMP}/overlap-guff.out"
+
+          locs() { grep -oE '^[^[:space:]]*\.go:[0-9]+:[0-9]+' "$1" | sort -u; }
+          locs "${RUNNER_TEMP}/overlap-golangci.out" > "${RUNNER_TEMP}/loc-golangci.txt"
+          locs "${RUNNER_TEMP}/overlap-guff.out"     > "${RUNNER_TEMP}/loc-guff.txt"
+
+          {
+            echo
+            echo "### Findings overlap, config dropped"
+            echo
+            echo "| | locations |"
+            echo "|---|---:|"
+            echo "| golangci-lint | $(wc -l < "${RUNNER_TEMP}/loc-golangci.txt") |"
+            echo "| guff | $(wc -l < "${RUNNER_TEMP}/loc-guff.txt") |"
+            echo "| both | $(comm -12 "${RUNNER_TEMP}/loc-golangci.txt" "${RUNNER_TEMP}/loc-guff.txt" | wc -l) |"
+            echo "| golangci-lint only | $(comm -23 "${RUNNER_TEMP}/loc-golangci.txt" "${RUNNER_TEMP}/loc-guff.txt" | wc -l) |"
+            echo "| guff only | $(comm -13 "${RUNNER_TEMP}/loc-golangci.txt" "${RUNNER_TEMP}/loc-guff.txt" | wc -l) |"
+            echo
+            echo "Per linter:"
+            echo
+            echo '```'
+            echo "golangci-lint:"
+            grep -oE '\([a-z0-9_-]+\)$' "${RUNNER_TEMP}/overlap-golangci.out" | sort | uniq -c | sort -rn | head -12
+            echo "guff:"
+            grep -oE '\([a-z0-9_-]+\)$' "${RUNNER_TEMP}/overlap-guff.out" | sort | uniq -c | sort -rn | head -12
+            echo '```'
+          } >> "${RUNNER_TEMP}/notes.md"
+
       - name: Summary
         if: always()
         run: |
@@ -261,8 +321,10 @@ jobs:
             echo "the shape of a normal pull request. A non-zero exit means the tool"
             echo "failed, not that it found something."
             echo
-            echo "This config sets no \`new-from-*\` filter, so the findings column is"
-            echo "directly comparable between the two tools across all packages."
+            echo "Expect **0 findings** on the config-driven runs: upstream enforces"
+            echo "this exact gate, so main is clean under it. That is agreement on an"
+            echo "empty set — see the overlap section below for a comparison with"
+            echo "something actually in it."
             echo
             echo "**Cache correctness:** ${CACHE_VERDICT:-not evaluated}"
             if [ -s "${RUNNER_TEMP}/cache-diff.txt" ]; then
