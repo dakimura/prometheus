@@ -40,6 +40,15 @@ on:
         description: golangci-lint version (guff's declared compat pin by default)
         required: false
         default: "2.12.2"
+      warm-go-cache:
+        description: >
+          Let actions/setup-go restore GOCACHE from a previous run. This is the
+          single largest source of variance in these numbers — see the note in
+          the summary — so it is an explicit switch rather than an accident.
+        required: false
+        default: "true"
+        type: choice
+        options: ["true", "false"]
 
 permissions:
   contents: read
@@ -52,9 +61,10 @@ jobs:
       - uses: actions/checkout@v4
 
       - uses: actions/setup-go@v5
+        id: setup-go
         with:
           go-version-file: go.mod
-          cache: true
+          cache: ${{ inputs.warm-go-cache == 'true' }}
 
       - name: Install both linters
         env:
@@ -90,6 +100,12 @@ jobs:
             echo "golangci  : $(golangci-lint version 2>&1 | head -1)"
             echo "commit    : ${GITHUB_SHA}"
             echo "packages  : $(go list ./... | wc -l) root packages"
+            # The number that explains most run-to-run variance here. With a
+            # restored GOCACHE golangci-lint's cold run has been ~70s; without
+            # one, ~120s. guff moved by 0.2s between the same two runs, because
+            # once its own cache is cold the work it does barely touches the Go
+            # build cache. Recording it stops that swing from reading as noise.
+            echo "GOCACHE   : setup-go cache requested=${{ inputs.warm-go-cache }} restored=${{ steps.setup-go.outputs.cache-hit || 'false' }}"
           } | tee "${RUNNER_TEMP}/environment.txt"
 
           {
@@ -295,7 +311,11 @@ jobs:
               > "${RUNNER_TEMP}/cache-diff.txt" || true
           fi
 
-          locs() { grep -oE '^[^[:space:]]*\.go:[0-9]+:[0-9]+' "$1" | sort -u; }
+          # LC_ALL=C throughout: `comm` requires its inputs sorted in the same
+          # collation it compares in, and disagreeing on that produces wrong
+          # counts with only a warning on stderr. Pinning the locale is the
+          # difference between a number and a number-shaped thing.
+          locs() { LC_ALL=C grep -oE '^[^[:space:]]*\.go:[0-9]+:[0-9]+' "$1" | LC_ALL=C sort -u; }
           locs "${RUNNER_TEMP}/overlap-golangci.out" > "${RUNNER_TEMP}/loc-golangci.txt"
           locs "${RUNNER_TEMP}/overlap-guff.out"     > "${RUNNER_TEMP}/loc-guff.txt"
 
@@ -307,9 +327,9 @@ jobs:
             echo "|---|---:|"
             echo "| golangci-lint | $(wc -l < "${RUNNER_TEMP}/loc-golangci.txt") |"
             echo "| guff | $(wc -l < "${RUNNER_TEMP}/loc-guff.txt") |"
-            echo "| both | $(comm -12 "${RUNNER_TEMP}/loc-golangci.txt" "${RUNNER_TEMP}/loc-guff.txt" | wc -l) |"
-            echo "| golangci-lint only | $(comm -23 "${RUNNER_TEMP}/loc-golangci.txt" "${RUNNER_TEMP}/loc-guff.txt" | wc -l) |"
-            echo "| guff only | $(comm -13 "${RUNNER_TEMP}/loc-golangci.txt" "${RUNNER_TEMP}/loc-guff.txt" | wc -l) |"
+            echo "| both | $(LC_ALL=C comm -12 "${RUNNER_TEMP}/loc-golangci.txt" "${RUNNER_TEMP}/loc-guff.txt" | wc -l) |"
+            echo "| golangci-lint only | $(LC_ALL=C comm -23 "${RUNNER_TEMP}/loc-golangci.txt" "${RUNNER_TEMP}/loc-guff.txt" | wc -l) |"
+            echo "| guff only | $(LC_ALL=C comm -13 "${RUNNER_TEMP}/loc-golangci.txt" "${RUNNER_TEMP}/loc-guff.txt" | wc -l) |"
             echo
             echo "Per linter:"
             echo
