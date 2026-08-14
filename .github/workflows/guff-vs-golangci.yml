@@ -1,0 +1,303 @@
+name: guff vs golangci-lint
+
+# Times this repository's own lint gate under golangci-lint and under guff
+# (https://github.com/dakimura/guff), a Rust reimplementation that reads the
+# same `.golangci.yml`.
+#
+# This branch of the fork exists only to produce those numbers. Nothing here
+# is meant to be merged upstream.
+#
+# Why Prometheus: 113 root packages under a genuinely heavy configuration —
+# revive with two dozen rules, gocritic and govet at enable-all, staticcheck,
+# modernize — heavy enough that upstream sets `run.timeout: 15m`. It is a real
+# gate on real code, not a synthetic corpus.
+#
+# Fairness rules, since the whole point is a number someone can trust:
+#
+#   * ONE job, one runner, one checkout. Runner-to-runner variance on shared CI
+#     is larger than a lot of the differences being measured.
+#   * `go build ./...` before either tool, so neither pays for a cold GOCACHE
+#     that the other then benefits from.
+#   * Each tool's own cache starts as a fresh empty directory, so "cold" means
+#     cold rather than whatever the image happened to ship.
+#   * `--issues-exit-code 0` everywhere: findings must not abort the run, so a
+#     non-zero exit in the table means the tool genuinely failed.
+#   * golangci-lint is pinned to the version guff declares compatibility with,
+#     so a behavioural difference is not just a version gap.
+#
+# Unlike a repo that sets `new-from-merge-base`, this config filters nothing,
+# so the findings column is directly comparable between the two tools across
+# all 113 packages.
+
+on:
+  workflow_dispatch:
+    inputs:
+      guff-version:
+        description: guff release tag to benchmark
+        required: false
+        default: v0.4.1
+      golangci-version:
+        description: golangci-lint version (guff's declared compat pin by default)
+        required: false
+        default: "2.12.2"
+
+permissions:
+  contents: read
+
+jobs:
+  benchmark:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Install both linters
+        env:
+          GUFF_VERSION: ${{ inputs.guff-version }}
+          GOLANGCI_VERSION: ${{ inputs.golangci-version }}
+        run: |
+          set -euo pipefail
+          mkdir -p "${HOME}/.local/bin"
+          echo "${HOME}/.local/bin" >> "${GITHUB_PATH}"
+
+          # guff: a pinned tag names its release asset directly, so this is one
+          # download and no API round-trip.
+          ver="${GUFF_VERSION#v}"
+          curl -sSfL -o /tmp/guff.tar.gz \
+            "https://github.com/dakimura/guff/releases/download/${GUFF_VERSION}/guff_${ver}_linux_amd64.tar.gz"
+          tar -xzf /tmp/guff.tar.gz -C /tmp
+          install -m 755 /tmp/guff "${HOME}/.local/bin/guff"
+
+          curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/HEAD/install.sh \
+            | sh -s -- -b "${HOME}/.local/bin" "v${GOLANGCI_VERSION}"
+
+      - name: Record the environment
+        run: |
+          set -euo pipefail
+          {
+            echo "## Environment"
+            echo
+            echo '```'
+            echo "runner    : $(nproc) cores, $(free -g | awk '/^Mem:/{print $2}') GB RAM"
+            echo "go        : $(go version)"
+            echo "guff      : $(guff version)"
+            echo "golangci  : $(golangci-lint version 2>&1 | head -1)"
+            echo "commit    : ${GITHUB_SHA}"
+            echo "packages  : $(go list ./... | wc -l) root packages"
+            echo '```'
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: Warm the Go build cache
+        # Untimed and non-fatal: this only equalizes GOCACHE between the tools.
+        run: go build ./... || true
+
+      - name: Benchmark
+        run: |
+          # No `-e`: a tool that fails is a result to record, not a reason to
+          # abandon the remaining measurements.
+          set -uo pipefail
+
+          RESULTS="${RUNNER_TEMP}/results.tsv"
+          : > "${RESULTS}"
+
+          # measure <label> <command...>
+          # Wall-clock milliseconds, exit status, and a findings count.
+          measure() {
+            local label="$1"; shift
+            local slug out start end status findings
+            slug="$(echo "${label}" | tr ' ()' '___')"
+            out="${RUNNER_TEMP}/${slug}.out"
+
+            start=$(date +%s%3N)
+            "$@" > "${out}" 2>&1
+            status=$?
+            end=$(date +%s%3N)
+
+            # Both tools print `path.go:line:col: message (linter)` per finding
+            # and indent the source excerpt beneath it, so anchoring to an
+            # unindented file:line:col prefix counts findings without counting
+            # context lines or the trailing summary block.
+            findings=$(grep -cE '^[^[:space:]].*\.go:[0-9]+:[0-9]+: ' "${out}" || true)
+
+            printf '%s\t%s\t%s\t%s\n' "${label}" "$((end - start))" "${status}" "${findings}" >> "${RESULTS}"
+            echo "::group::${label} — $(( (end - start) / 1000 ))s, exit ${status}, ${findings} findings"
+            tail -n 30 "${out}"
+            echo "::endgroup::"
+
+            # Deliberately global: callers that need a specific run's output
+            # copy it somewhere stable rather than re-deriving the slug, which
+            # is exactly the kind of string surgery that silently stops
+            # matching when a label changes.
+            LAST_OUT="${out}"
+          }
+
+          # One file, edited between the warm and incremental runs. tsdb/head.go
+          # is imported widely enough that its dependents have to be revisited,
+          # which is the point: an incremental number taken from a leaf package
+          # would flatter both tools equally and describe nothing.
+          TOUCH_PATH="${GITHUB_WORKSPACE}/tsdb/head.go"
+          perturb() { printf '\n// guff-bench: incremental measurement\n' >> "${TOUCH_PATH}"; }
+          restore() { git -C "${GITHUB_WORKSPACE}" checkout -- "${TOUCH_PATH}"; }
+
+          ####################################################################
+          # golangci-lint
+          ####################################################################
+          export GOLANGCI_LINT_CACHE="${RUNNER_TEMP}/golangci-cache"
+          rm -rf "${GOLANGCI_LINT_CACHE}"; mkdir -p "${GOLANGCI_LINT_CACHE}"
+
+          measure "golangci-lint cold" golangci-lint run --issues-exit-code 0 ./...
+          measure "golangci-lint warm" golangci-lint run --issues-exit-code 0 ./...
+          perturb
+          measure "golangci-lint incremental" golangci-lint run --issues-exit-code 0 ./...
+          restore
+
+          ####################################################################
+          # guff, in both cache shapes.
+          #
+          # Its Action ships with the type-checking seed overlays disabled
+          # (GUFF_SEED_PERSIST=0) because they dominate cache size, so
+          # `seedless` is the configuration anyone would actually deploy and
+          # `seeded` says what that default costs in wall time. Measuring only
+          # one would describe a setup nobody runs.
+          ####################################################################
+          for mode in seedless seeded; do
+            export GUFF_CACHE="${RUNNER_TEMP}/guff-cache-${mode}"
+            rm -rf "${GUFF_CACHE}"; mkdir -p "${GUFF_CACHE}"
+            if [ "${mode}" = seedless ]; then
+              export GUFF_SEED_PERSIST=0
+            else
+              unset GUFF_SEED_PERSIST
+            fi
+
+            measure "guff cold (${mode})" guff run --issues-exit-code 0 ./...
+            measure "guff warm (${mode})" guff run --issues-exit-code 0 ./...
+            if [ "${mode}" = seedless ]; then
+              cp "${LAST_OUT}" "${RUNNER_TEMP}/warm-seedless.out"
+            fi
+            perturb
+            measure "guff incremental (${mode})" guff run --issues-exit-code 0 ./...
+            restore
+          done
+          unset GUFF_SEED_PERSIST
+
+          ####################################################################
+          # Does the cache change what is reported? The claim behind caching by
+          # default is that it is memoization, not approximation, so a cached
+          # run and a cold one must be byte-identical on the same tree.
+          ####################################################################
+          export GUFF_CACHE="${RUNNER_TEMP}/guff-cache-seedless"
+          export GUFF_SEED_PERSIST=0
+          measure "guff --no-cache (ground truth)" guff run --no-cache --issues-exit-code 0 ./...
+          cp "${LAST_OUT}" "${RUNNER_TEMP}/ground-truth.out"
+
+          if diff -q "${RUNNER_TEMP}/warm-seedless.out" \
+                     "${RUNNER_TEMP}/ground-truth.out" >/dev/null 2>&1; then
+            echo "CACHE_VERDICT=identical to a cold run" >> "${GITHUB_ENV}"
+          else
+            echo "CACHE_VERDICT=**DIVERGED from a cold run — see the diff below**" >> "${GITHUB_ENV}"
+            diff -u "${RUNNER_TEMP}/warm-seedless.out" \
+                    "${RUNNER_TEMP}/ground-truth.out" \
+              > "${RUNNER_TEMP}/cache-diff.txt" || true
+          fi
+
+          ####################################################################
+          # Cache transfer cost. A warm run only wins if restoring the cache
+          # costs less than the work it skips, and that is the half a
+          # wall-clock table cannot show. actions/cache compresses before
+          # upload, so compressed size is the number that decides it.
+          ####################################################################
+          {
+            echo "### Cache transfer cost"
+            echo
+            echo "| cache | on disk | compressed | compress time |"
+            echo "|---|---:|---:|---:|"
+          } > "${RUNNER_TEMP}/notes.md"
+
+          archive_cost() {
+            local label="$1" dir="$2" raw gz start end
+            [ -d "${dir}" ] || return 0
+            raw=$(du -sh "${dir}" 2>/dev/null | cut -f1)
+            start=$(date +%s%3N)
+            tar -czf "${RUNNER_TEMP}/${label}.tar.gz" -C "${dir}" . 2>/dev/null
+            end=$(date +%s%3N)
+            gz=$(du -sh "${RUNNER_TEMP}/${label}.tar.gz" 2>/dev/null | cut -f1)
+            printf '| %s | %s | %s | %d.%03ds |\n' \
+              "${label}" "${raw}" "${gz}" "$(( (end - start) / 1000 ))" "$(( (end - start) % 1000 ))" \
+              >> "${RUNNER_TEMP}/notes.md"
+            rm -f "${RUNNER_TEMP}/${label}.tar.gz"
+          }
+
+          archive_cost "guff-seedless" "${RUNNER_TEMP}/guff-cache-seedless"
+          archive_cost "guff-seeded" "${RUNNER_TEMP}/guff-cache-seeded"
+          archive_cost "golangci-lint" "${GOLANGCI_LINT_CACHE}"
+
+      - name: Summary
+        if: always()
+        run: |
+          set -euo pipefail
+          RESULTS="${RUNNER_TEMP}/results.tsv"
+          if [ ! -s "${RESULTS}" ]; then
+            echo "No measurements were recorded." >> "${GITHUB_STEP_SUMMARY}"
+            exit 0
+          fi
+
+          {
+            echo "## Results"
+            echo
+            echo "| run | wall | exit | findings |"
+            echo "|---|---:|---:|---:|"
+            while IFS=$'\t' read -r label ms status findings; do
+              printf '| %s | %d.%03ds | %s | %s |\n' \
+                "${label}" "$((ms / 1000))" "$((ms % 1000))" "${status}" "${findings}"
+            done < "${RESULTS}"
+            echo
+            echo "\`cold\` is what a CI run without a persisted cache pays every time."
+            echo "\`incremental\` is a warm cache with one widely-imported file edited —"
+            echo "the shape of a normal pull request. A non-zero exit means the tool"
+            echo "failed, not that it found something."
+            echo
+            echo "This config sets no \`new-from-*\` filter, so the findings column is"
+            echo "directly comparable between the two tools across all packages."
+            echo
+            echo "**Cache correctness:** ${CACHE_VERDICT:-not evaluated}"
+            if [ -s "${RUNNER_TEMP}/cache-diff.txt" ]; then
+              echo
+              echo '<details><summary>cached vs --no-cache diff</summary>'
+              echo
+              echo '```diff'
+              head -c 30000 "${RUNNER_TEMP}/cache-diff.txt"
+              echo '```'
+              echo '</details>'
+            fi
+            if [ -f "${RUNNER_TEMP}/notes.md" ]; then
+              echo
+              cat "${RUNNER_TEMP}/notes.md"
+            fi
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+          cat "${RESULTS}"
+
+      - name: Upload raw output
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: lint-output
+          path: |
+            ${{ runner.temp }}/*.out
+            ${{ runner.temp }}/results.tsv
+          if-no-files-found: warn
+
+      - name: Confirm the tree was left clean
+        if: always()
+        run: |
+          set -euo pipefail
+          if [ -n "$(git status --porcelain)" ]; then
+            echo "::error::the benchmark left the working tree modified"
+            git status --porcelain
+            exit 1
+          fi
